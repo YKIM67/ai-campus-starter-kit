@@ -25,7 +25,11 @@ When implementing downstream feature branches or extension modules based on this
 """
 
 import hashlib
+import hmac
+import os
+import secrets
 import sqlite3
+import time
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -38,6 +42,11 @@ APP_VERSION = "0.1.0-alpha"
 ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
 DB_FILE = "service.db"
 
+# Todo admin auth: override via environment variables outside local dev.
+TODO_ADMIN_PASSWORD = os.getenv("TODO_ADMIN_PASSWORD", "admin1234")
+TODO_ADMIN_TOKEN_TTL_SECONDS = int(os.getenv("TODO_ADMIN_TOKEN_TTL_SECONDS", "3600"))
+BLOCKED_TAGS = ["spam", "ad", "private", "temp"]
+
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 
@@ -45,8 +54,10 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 # Database Initialization & Helpers
 # =====================================================================
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 
@@ -76,6 +87,19 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # 3. Todos Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            is_completed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            tags TEXT DEFAULT ''
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_todos_created_at ON todos (created_at)")
     conn.commit()
     conn.close()
 
@@ -116,6 +140,59 @@ class UserRegisterRequest(BaseModel):
 class ItemCreateRequest(BaseModel):
     title: str
     content: Optional[str] = ""
+
+
+class TodoCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    is_completed: bool = False
+    tags: Optional[str] = ""  # comma-separated, e.g. "work,urgent"
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+# =====================================================================
+# Todo Helpers
+# =====================================================================
+# Issued admin tokens -> expiry timestamp (in-memory; reset on restart)
+admin_tokens = {}
+
+
+def normalize_tags(raw_tags: Optional[str]) -> str:
+    """Trim, lowercase and drop empty/duplicate entries from a comma-separated tag string."""
+    if not raw_tags:
+        return ""
+    tags = []
+    seen = set()
+    for tag in raw_tags.split(","):
+        tag = tag.strip().lower()
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+    return ",".join(tags)
+
+
+def todo_row_to_dict(row: sqlite3.Row) -> dict:
+    todo = dict(row)
+    todo["is_completed"] = bool(todo["is_completed"])
+    return todo
+
+
+def issue_admin_token() -> str:
+    token = secrets.token_urlsafe(32)
+    admin_tokens[token] = time.time() + TODO_ADMIN_TOKEN_TTL_SECONDS
+    return token
+
+
+def verify_admin_token(token: Optional[str]) -> None:
+    expires_at = admin_tokens.get(token) if token else None
+    if expires_at is None:
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing admin token")
+    if expires_at < time.time():
+        admin_tokens.pop(token, None)
+        raise HTTPException(status_code=401, detail="Unauthorized: admin token expired")
 
 
 # =====================================================================
@@ -204,3 +281,98 @@ def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(Non
     conn.close()
     
     return {"success": True, "item_id": item_id, "title": req.title}
+
+
+# =====================================================================
+# Todo API Endpoints
+# =====================================================================
+@app.get("/todos")
+def list_todos():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY created_at DESC, id DESC")
+    todos = [todo_row_to_dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"total": len(todos), "todos": todos}
+
+
+@app.post("/todos", status_code=201)
+def create_todo(req: TodoCreateRequest):
+    if not req.title.strip():
+        raise HTTPException(status_code=400, detail="Title must not be empty")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO todos (title, description, is_completed, tags) VALUES (?, ?, ?, ?)",
+        (req.title.strip(), req.description or "", int(req.is_completed), normalize_tags(req.tags)),
+    )
+    todo_id = cursor.lastrowid
+    conn.commit()
+    cursor.execute("SELECT * FROM todos WHERE id = ?", (todo_id,))
+    todo = todo_row_to_dict(cursor.fetchone())
+    conn.close()
+    return {"success": True, "todo": todo}
+
+
+@app.get("/todos/search")
+def search_todos(q: str):
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query parameter 'q' must not be empty")
+
+    # Escape LIKE wildcards so the keyword is matched literally
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = "%" + escaped + "%"
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM todos WHERE title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' "
+        "ORDER BY created_at DESC, id DESC",
+        (pattern, pattern),
+    )
+    todos = [todo_row_to_dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"query": q, "total": len(todos), "todos": todos}
+
+
+@app.get("/todos/filtered")
+def filtered_todos():
+    blocked_set = set(BLOCKED_TAGS)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY created_at DESC, id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+
+    clean_todos = []
+    for row in rows:
+        tags = row["tags"].split(",") if row["tags"] else []
+        if not any(tag in blocked_set for tag in tags):
+            clean_todos.append(todo_row_to_dict(row))
+    return {"blocked_tags": BLOCKED_TAGS, "total": len(clean_todos), "todos": clean_todos}
+
+
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest):
+    if not hmac.compare_digest(req.password.encode("utf-8"), TODO_ADMIN_PASSWORD.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+    token = issue_admin_token()
+    return {"success": True, "token": token, "expires_in": TODO_ADMIN_TOKEN_TTL_SECONDS}
+
+
+@app.delete("/admin/todos/{todo_id}")
+def admin_delete_todo(todo_id: int, x_admin_token: Optional[str] = Header(None)):
+    verify_admin_token(x_admin_token)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return {"success": True, "deleted_id": todo_id}
